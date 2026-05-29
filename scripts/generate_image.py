@@ -7,11 +7,13 @@ Requires: httpx (pip install httpx)
 Usage:
     python3 generate_image.py --prompt "description" --filename "output.png" \
         [--input-image img1.png ...] [--resolution 1K|2K|4K] \
-        [--aspect-ratio 1:1|16:9|9:16|4:3|3:4]
+        [--aspect-ratio 1:1|16:9|9:16|4:3|3:4] \
+        [--partial-images 2]
 """
 
 import argparse
 import base64
+import json
 import mimetypes
 import os
 import sys
@@ -108,7 +110,7 @@ def validate_input_images(image_paths: list[str]) -> list[Path]:
     return paths
 
 
-def extract_image_value(response_json: dict[str, Any]) -> str:
+def find_image_value(response_json: dict[str, Any]) -> str | None:
     data = response_json.get("data")
     if isinstance(data, list) and data:
         first = data[0]
@@ -118,20 +120,58 @@ def extract_image_value(response_json: dict[str, Any]) -> str:
                 if isinstance(value, str) and value:
                     return value
 
-    for key in ("b64_json", "url", "image_url"):
+    item = response_json.get("item")
+    if isinstance(item, dict):
+        value = item.get("result")
+        if isinstance(value, str) and value:
+            return value
+
+    response = response_json.get("response")
+    if isinstance(response, dict):
+        output = response.get("output")
+        if isinstance(output, list):
+            for output_item in output:
+                if not isinstance(output_item, dict):
+                    continue
+                value = output_item.get("result")
+                if isinstance(value, str) and value:
+                    return value
+
+    for key in ("b64_json", "url", "image_url", "partial_image_b64"):
         value = response_json.get(key)
         if isinstance(value, str) and value:
             return value
 
+    return None
+
+
+def extract_image_value(response_json: dict[str, Any]) -> str:
+    image_value = find_image_value(response_json)
+    if image_value:
+        return image_value
     fail(f"No image payload in response: {response_json}")
+
+
+def decode_inline_image_bytes(image_value: str) -> bytes | None:
+    if image_value.startswith("data:"):
+        header, _, b64data = image_value.partition(",")
+        if ";base64" not in header or not b64data:
+            return None
+        return base64.b64decode(b64data)
+
+    if image_value.startswith("http://") or image_value.startswith("https://"):
+        return None
+
+    return base64.b64decode(image_value)
 
 
 def write_image_value(image_value: str, output_path: Path) -> None:
     if image_value.startswith("data:"):
-        header, _, b64data = image_value.partition(",")
-        if ";base64" not in header or not b64data:
+        image_bytes = decode_inline_image_bytes(image_value)
+        if image_bytes is None:
+            header, _, _ = image_value.partition(",")
             fail(f"Unsupported data URL encoding: {header}")
-        output_path.write_bytes(base64.b64decode(b64data))
+        output_path.write_bytes(image_bytes)
         return
 
     if image_value.startswith("http://") or image_value.startswith("https://"):
@@ -159,12 +199,97 @@ def write_image_value(image_value: str, output_path: Path) -> None:
         return
 
     try:
-        output_path.write_bytes(base64.b64decode(image_value))
+        image_bytes = decode_inline_image_bytes(image_value)
+        if image_bytes is None:
+            fail("Unsupported image value")
+        output_path.write_bytes(image_bytes)
     except Exception as exc:
         fail(f"Decode error: {exc}")
 
 
-def create_generation(prompt: str, size: str, api_key: str, base_url: str) -> dict[str, Any]:
+def iter_sse_data(lines: Any) -> Any:
+    data_lines: list[str] = []
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+        line = line.rstrip("\r")
+        if line == "":
+            if data_lines:
+                yield "\n".join(data_lines)
+                data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
+def event_type(payload: dict[str, Any]) -> str:
+    value = payload.get("type")
+    return value if isinstance(value, str) else ""
+
+
+def is_partial_image_event(payload: dict[str, Any]) -> bool:
+    type_value = event_type(payload)
+    return type_value.endswith(".partial_image") or type_value == "response.image_generation_call.partial_image"
+
+
+def log_partial_image_progress(payload: dict[str, Any], seen_count: int, requested_count: int | None) -> None:
+    raw_index = payload.get("partial_image_index")
+    if isinstance(raw_index, int):
+        progress_index = raw_index + 1
+    else:
+        progress_index = seen_count
+
+    total = str(requested_count) if requested_count and requested_count > 0 else "?"
+    image_value = find_image_value(payload)
+    byte_count = None
+    if image_value:
+        try:
+            image_bytes = decode_inline_image_bytes(image_value)
+            byte_count = len(image_bytes) if image_bytes is not None else None
+        except Exception:
+            byte_count = None
+
+    size_text = format_bytes(byte_count) if byte_count is not None else "unknown size"
+    image_size = payload.get("size")
+    suffix = f", image size: {image_size}" if isinstance(image_size, str) and image_size else ""
+    print(f"Partial image {progress_index}/{total}: {size_text}{suffix}")
+
+
+def read_streaming_image_response(response: Any, partial_images: int | None) -> dict[str, Any]:
+    final_payload: dict[str, Any] | None = None
+    partial_count = 0
+    for data_text in iter_sse_data(response.iter_lines()):
+        if data_text == "[DONE]":
+            break
+        try:
+            payload = json.loads(data_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        if is_partial_image_event(payload):
+            partial_count += 1
+            log_partial_image_progress(payload, partial_count, partial_images)
+            continue
+
+        if find_image_value(payload):
+            final_payload = payload
+
+    if final_payload is None:
+        fail("No final image payload in streaming response")
+    return final_payload
+
+
+def create_generation(
+    prompt: str,
+    size: str,
+    api_key: str,
+    base_url: str,
+    stream: bool,
+    partial_images: int | None,
+) -> dict[str, Any]:
     import httpx
 
     url = build_url(base_url, "/images/generations")
@@ -174,6 +299,10 @@ def create_generation(prompt: str, size: str, api_key: str, base_url: str) -> di
         "size": size,
         "n": 1,
     }
+    if stream:
+        payload["stream"] = True
+        if partial_images and partial_images > 0:
+            payload["partial_images"] = partial_images
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -181,10 +310,16 @@ def create_generation(prompt: str, size: str, api_key: str, base_url: str) -> di
 
     print(f"Submitting generation to {url} ...")
     print(f"Model: {MODEL}, size: {size}")
+    if stream:
+        print(f"Streaming enabled, partial_images: {partial_images or 0}")
 
     for attempt in range(MAX_RETRIES + 1):
         try:
             with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                if stream:
+                    with client.stream("POST", url, json=payload, headers=headers) as response:
+                        response.raise_for_status()
+                        return read_streaming_image_response(response, partial_images)
                 response = client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
                 return response.json()
@@ -208,6 +343,8 @@ def create_edit(
     size: str,
     api_key: str,
     base_url: str,
+    stream: bool,
+    partial_images: int | None,
 ) -> dict[str, Any]:
     import httpx
 
@@ -218,10 +355,16 @@ def create_edit(
         "size": size,
         "n": "1",
     }
+    if stream:
+        data["stream"] = "true"
+        if partial_images and partial_images > 0:
+            data["partial_images"] = str(partial_images)
     headers = {"Authorization": f"Bearer {api_key}"}
 
     print(f"Submitting edit to {url} ...")
     print(f"Model: {MODEL}, size: {size}")
+    if stream:
+        print(f"Streaming enabled, partial_images: {partial_images or 0}")
     for path in image_paths:
         print(f"Loaded input image: {path}")
 
@@ -236,6 +379,10 @@ def create_edit(
                 files.append(("image[]", (path.name, file_obj, mime_type)))
 
             with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                if stream:
+                    with client.stream("POST", url, data=data, files=files, headers=headers) as response:
+                        response.raise_for_status()
+                        return read_streaming_image_response(response, partial_images)
                 response = client.post(url, data=data, files=files, headers=headers)
                 response.raise_for_status()
                 return response.json()
@@ -275,6 +422,12 @@ def main() -> None:
         default="16:9",
         help="Aspect ratio (default: 16:9)",
     )
+    parser.add_argument(
+        "--partial-images",
+        type=int,
+        default=2,
+        help="Partial image previews to request; >0 enables streaming, 0 disables it (default: 2)",
+    )
     args = parser.parse_args()
 
     api_key = required_env(API_KEY_ENV)
@@ -284,13 +437,17 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     size = resolve_size(args.resolution, args.aspect_ratio)
+    partial_images = args.partial_images
+    if partial_images is not None and partial_images < 0:
+        fail("--partial-images must be 0 or greater")
+    stream = partial_images > 0
 
     start_time = time.perf_counter()
     if args.input_image:
         image_paths = validate_input_images(args.input_image)
-        response_json = create_edit(args.prompt, image_paths, size, api_key, base_url)
+        response_json = create_edit(args.prompt, image_paths, size, api_key, base_url, stream, partial_images)
     else:
-        response_json = create_generation(args.prompt, size, api_key, base_url)
+        response_json = create_generation(args.prompt, size, api_key, base_url, stream, partial_images)
 
     image_value = extract_image_value(response_json)
     write_image_value(image_value, output_path)
