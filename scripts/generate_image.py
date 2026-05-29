@@ -24,6 +24,8 @@ BASE_URL_ENV = "CHATGPT_IMAGE_API_BASE"
 MODEL = os.environ.get("CHATGPT_IMAGE_MODEL") or "gpt-image-2"
 
 REQUEST_TIMEOUT_SECONDS = 600
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 10
 
 SIZE_MAP = {
     "1K": {
@@ -64,6 +66,16 @@ def format_bytes(byte_count: int) -> str:
                 return f"{byte_count} {unit}"
             return f"{size:.2f} {unit} ({byte_count:,} bytes)"
         size /= 1024
+
+
+def can_retry(attempt: int) -> bool:
+    return attempt < MAX_RETRIES
+
+
+def wait_before_retry(reason: str, attempt: int) -> None:
+    retry_number = attempt + 1
+    print(f"{reason}; retrying in {RETRY_DELAY_SECONDS}s ({retry_number}/{MAX_RETRIES}) ...")
+    time.sleep(RETRY_DELAY_SECONDS)
 
 
 def required_env(name: str) -> str:
@@ -125,15 +137,25 @@ def write_image_value(image_value: str, output_path: Path) -> None:
     if image_value.startswith("http://") or image_value.startswith("https://"):
         import httpx
 
-        try:
-            with httpx.Client(timeout=120, follow_redirects=True) as client:
-                response = client.get(image_value)
-                response.raise_for_status()
-                output_path.write_bytes(response.content)
-        except httpx.HTTPStatusError as exc:
-            fail(f"Download error {exc.response.status_code}: {exc.response.text}")
-        except Exception as exc:
-            fail(f"Download error: {exc}")
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=120, follow_redirects=True) as client:
+                    response = client.get(image_value)
+                    response.raise_for_status()
+                    output_path.write_bytes(response.content)
+                    return
+            except httpx.TimeoutException as exc:
+                if can_retry(attempt):
+                    wait_before_retry("Download timed out", attempt)
+                    continue
+                fail(f"Download timeout after {MAX_RETRIES} retries: {exc}")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 502 and can_retry(attempt):
+                    wait_before_retry("Download returned 502", attempt)
+                    continue
+                fail(f"Download error {exc.response.status_code}: {exc.response.text}")
+            except Exception as exc:
+                fail(f"Download error: {exc}")
         return
 
     try:
@@ -160,15 +182,24 @@ def create_generation(prompt: str, size: str, api_key: str, base_url: str) -> di
     print(f"Submitting generation to {url} ...")
     print(f"Model: {MODEL}, size: {size}")
 
-    try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        fail(f"API error {exc.response.status_code}: {exc.response.text}")
-    except Exception as exc:
-        fail(f"Request error: {exc}")
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                response = client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.json()
+        except httpx.TimeoutException as exc:
+            if can_retry(attempt):
+                wait_before_retry("Request timed out", attempt)
+                continue
+            fail(f"Request timeout after {MAX_RETRIES} retries: {exc}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 502 and can_retry(attempt):
+                wait_before_retry("API returned 502", attempt)
+                continue
+            fail(f"API error {exc.response.status_code}: {exc.response.text}")
+        except Exception as exc:
+            fail(f"Request error: {exc}")
 
 
 def create_edit(
@@ -191,28 +222,38 @@ def create_edit(
 
     print(f"Submitting edit to {url} ...")
     print(f"Model: {MODEL}, size: {size}")
+    for path in image_paths:
+        print(f"Loaded input image: {path}")
 
-    open_files = []
-    try:
-        files = []
-        for path in image_paths:
-            mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
-            file_obj = path.open("rb")
-            open_files.append(file_obj)
-            files.append(("image[]", (path.name, file_obj, mime_type)))
-            print(f"Loaded input image: {path}")
+    for attempt in range(MAX_RETRIES + 1):
+        open_files = []
+        try:
+            files = []
+            for path in image_paths:
+                mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+                file_obj = path.open("rb")
+                open_files.append(file_obj)
+                files.append(("image[]", (path.name, file_obj, mime_type)))
 
-        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = client.post(url, data=data, files=files, headers=headers)
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        fail(f"API error {exc.response.status_code}: {exc.response.text}")
-    except Exception as exc:
-        fail(f"Request error: {exc}")
-    finally:
-        for file_obj in open_files:
-            file_obj.close()
+            with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                response = client.post(url, data=data, files=files, headers=headers)
+                response.raise_for_status()
+                return response.json()
+        except httpx.TimeoutException as exc:
+            if can_retry(attempt):
+                wait_before_retry("Request timed out", attempt)
+                continue
+            fail(f"Request timeout after {MAX_RETRIES} retries: {exc}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 502 and can_retry(attempt):
+                wait_before_retry("API returned 502", attempt)
+                continue
+            fail(f"API error {exc.response.status_code}: {exc.response.text}")
+        except Exception as exc:
+            fail(f"Request error: {exc}")
+        finally:
+            for file_obj in open_files:
+                file_obj.close()
 
 
 def main() -> None:
