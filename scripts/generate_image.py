@@ -15,6 +15,7 @@ import base64
 import mimetypes
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ API_KEY_ENV = "CHATGPT_IMAGE_API_KEY"
 BASE_URL_ENV = "CHATGPT_IMAGE_API_BASE"
 MODEL = os.environ.get("CHATGPT_IMAGE_MODEL") or "gpt-image-2"
 
-REQUEST_TIMEOUT_SECONDS = 300
+REQUEST_TIMEOUT_SECONDS = 600
 
 SIZE_MAP = {
     "1K": {
@@ -52,6 +53,17 @@ SIZE_MAP = {
 def fail(message: str) -> None:
     print(f"Error: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def format_bytes(byte_count: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    size = float(byte_count)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{byte_count} {unit}"
+            return f"{size:.2f} {unit} ({byte_count:,} bytes)"
+        size /= 1024
 
 
 def required_env(name: str) -> str:
@@ -232,6 +244,7 @@ def main() -> None:
 
     size = resolve_size(args.resolution, args.aspect_ratio)
 
+    start_time = time.perf_counter()
     if args.input_image:
         image_paths = validate_input_images(args.input_image)
         response_json = create_edit(args.prompt, image_paths, size, api_key, base_url)
@@ -240,8 +253,12 @@ def main() -> None:
 
     image_value = extract_image_value(response_json)
     write_image_value(image_value, output_path)
+    elapsed_seconds = time.perf_counter() - start_time
+    file_size = output_path.stat().st_size
 
     print(f"\nImage saved: {output_path.resolve()}")
+    print(f"File size: {format_bytes(file_size)}")
+    print(f"Generation time: {elapsed_seconds:.2f} seconds")
 
 
 if __name__ == "__main__":
