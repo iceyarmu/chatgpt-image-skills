@@ -8,7 +8,7 @@ Usage:
     python3 generate_image.py --prompt "description" --filename "output.png" \
         [--input-image img1.png ...] [--resolution 1K|2K|4K] \
         [--aspect-ratio 1:1|16:9|9:16|4:3|3:4] \
-        [--partial-images 2]
+        [--partial-images 3]
 """
 
 import argparse
@@ -78,6 +78,31 @@ def wait_before_retry(reason: str, attempt: int) -> None:
     retry_number = attempt + 1
     print(f"{reason}; retrying in {RETRY_DELAY_SECONDS}s ({retry_number}/{MAX_RETRIES}) ...")
     time.sleep(RETRY_DELAY_SECONDS)
+
+
+def raise_for_status_with_body(response: Any) -> None:
+    try:
+        response.raise_for_status()
+    except Exception:
+        try:
+            response.read()
+        except Exception:
+            pass
+        raise
+
+
+def read_response_text(response: Any) -> str:
+    try:
+        return response.text
+    except Exception:
+        try:
+            body = response.read()
+        except Exception as exc:
+            return f"<unable to read response body: {exc}>"
+        if isinstance(body, bytes):
+            encoding = getattr(response, "encoding", None) or "utf-8"
+            return body.decode(encoding, errors="replace")
+        return str(body)
 
 
 def required_env(name: str) -> str:
@@ -181,7 +206,7 @@ def write_image_value(image_value: str, output_path: Path) -> None:
             try:
                 with httpx.Client(timeout=120, follow_redirects=True) as client:
                     response = client.get(image_value)
-                    response.raise_for_status()
+                    raise_for_status_with_body(response)
                     output_path.write_bytes(response.content)
                     return
             except httpx.TimeoutException as exc:
@@ -193,7 +218,7 @@ def write_image_value(image_value: str, output_path: Path) -> None:
                 if exc.response.status_code == 502 and can_retry(attempt):
                     wait_before_retry("Download returned 502", attempt)
                     continue
-                fail(f"Download error {exc.response.status_code}: {exc.response.text}")
+                fail(f"Download error {exc.response.status_code}: {read_response_text(exc.response)}")
             except Exception as exc:
                 fail(f"Download error: {exc}")
         return
@@ -318,10 +343,10 @@ def create_generation(
             with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
                 if stream:
                     with client.stream("POST", url, json=payload, headers=headers) as response:
-                        response.raise_for_status()
+                        raise_for_status_with_body(response)
                         return read_streaming_image_response(response, partial_images)
                 response = client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
+                raise_for_status_with_body(response)
                 return response.json()
         except httpx.TimeoutException as exc:
             if can_retry(attempt):
@@ -332,7 +357,7 @@ def create_generation(
             if exc.response.status_code == 502 and can_retry(attempt):
                 wait_before_retry("API returned 502", attempt)
                 continue
-            fail(f"API error {exc.response.status_code}: {exc.response.text}")
+            fail(f"API error {exc.response.status_code}: {read_response_text(exc.response)}")
         except Exception as exc:
             fail(f"Request error: {exc}")
 
@@ -381,10 +406,10 @@ def create_edit(
             with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
                 if stream:
                     with client.stream("POST", url, data=data, files=files, headers=headers) as response:
-                        response.raise_for_status()
+                        raise_for_status_with_body(response)
                         return read_streaming_image_response(response, partial_images)
                 response = client.post(url, data=data, files=files, headers=headers)
-                response.raise_for_status()
+                raise_for_status_with_body(response)
                 return response.json()
         except httpx.TimeoutException as exc:
             if can_retry(attempt):
@@ -395,7 +420,7 @@ def create_edit(
             if exc.response.status_code == 502 and can_retry(attempt):
                 wait_before_retry("API returned 502", attempt)
                 continue
-            fail(f"API error {exc.response.status_code}: {exc.response.text}")
+            fail(f"API error {exc.response.status_code}: {read_response_text(exc.response)}")
         except Exception as exc:
             fail(f"Request error: {exc}")
         finally:
@@ -425,8 +450,8 @@ def main() -> None:
     parser.add_argument(
         "--partial-images",
         type=int,
-        default=2,
-        help="Partial image previews to request; >0 enables streaming, 0 disables it (default: 2)",
+        default=3,
+        help="Partial image previews to request; >0 enables streaming, 0 disables it (default: 3)",
     )
     args = parser.parse_args()
 
