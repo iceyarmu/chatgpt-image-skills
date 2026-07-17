@@ -18,6 +18,13 @@ python3 ~/.hermes/skills/chatgpt-image-skills/scripts/generate_image.py \
 
 Always run from the user's working directory. Do not `cd` to the skill directory.
 
+When invoking the script through the Hermes terminal tool, run it with
+`background=true` and `notify_on_complete=true`. A generation plus retries can
+exceed the terminal's 600-second foreground limit.
+
+The script always uses SSE streaming. It retries incomplete streams, transport
+errors, HTTP 429, and transient HTTP 5xx responses up to three times.
+
 ## Parameters
 
 | Parameter | Required | Default | Description |
