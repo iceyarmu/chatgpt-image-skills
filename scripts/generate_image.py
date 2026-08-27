@@ -290,6 +290,7 @@ def create_generation(
         "model": MODEL,
         "prompt": prompt,
         "size": size,
+        "quality": "high",
         "n": 1,
         "stream": True,
     }
@@ -352,6 +353,7 @@ def create_edit(
         "model": MODEL,
         "prompt": prompt,
         "size": size,
+        "quality": "high",
         "n": "1",
         "stream": "true",
     }
