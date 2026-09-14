@@ -418,7 +418,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate images via the OpenAI ChatGPT Image API")
     parser.add_argument("--prompt", "-p", required=True, help="Image description/prompt")
     parser.add_argument("--filename", "-f", required=True, help="Output filename")
-    parser.add_argument("--input-image", "-i", nargs="+", help="Input image path(s) for editing")
+    parser.add_argument(
+        "--input-image", "-i", nargs="+", action="extend",
+        help="Input image path(s) for editing; can be repeated",
+    )
     parser.add_argument(
         "--resolution",
         "-r",
