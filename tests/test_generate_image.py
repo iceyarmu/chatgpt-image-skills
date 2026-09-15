@@ -1,4 +1,5 @@
 import base64
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -85,6 +86,23 @@ def install_fake_client(monkeypatch, outcomes, calls, opened_files=None):
             return outcome
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
+
+
+def test_read_prompt_from_file(tmp_path):
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text("a detailed prompt\n", encoding="utf-8")
+
+    assert generate_image.read_prompt(str(prompt_path)) == "a detailed prompt\n"
+
+
+def test_read_prompt_from_stdin(monkeypatch):
+    monkeypatch.setattr(generate_image.sys, "stdin", io.StringIO("prompt from stdin"))
+
+    assert generate_image.read_prompt("-") == "prompt from stdin"
+
+
+def test_read_prompt_keeps_literal_text_when_file_does_not_exist():
+    assert generate_image.read_prompt("literal prompt") == "literal prompt"
 
 
 def test_final_sse_response_can_be_saved(tmp_path):

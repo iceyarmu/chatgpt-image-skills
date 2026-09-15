@@ -29,7 +29,7 @@ errors, HTTP 429, and transient HTTP 5xx responses up to three times.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `--prompt` / `-p` | Yes | - | Image description or edit instruction |
+| `--prompt` / `-p` | Yes | - | Image description or edit instruction; pass a UTF-8 file path to read a prompt from a file, or `-` to read from stdin |
 | `--filename` / `-f` | Yes | - | Output file path (`.png`) |
 | `--input-image` / `-i` | No | - | Input image path(s) for editing; pass one or more |
 | `--resolution` / `-r` | No | `2K` | `1K`, `2K`, or `4K` |

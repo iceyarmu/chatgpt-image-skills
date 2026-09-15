@@ -130,6 +130,21 @@ def validate_input_images(image_paths: list[str]) -> list[Path]:
     return paths
 
 
+def read_prompt(prompt_argument: str) -> str:
+    """Resolve a prompt argument from stdin, a UTF-8 file, or literal text."""
+    if prompt_argument == "-":
+        return sys.stdin.read()
+
+    prompt_path = Path(prompt_argument)
+    if prompt_path.is_file():
+        try:
+            return prompt_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ImageRequestError(f"Could not read prompt file: {exc}") from exc
+
+    return prompt_argument
+
+
 def find_image_value(response_json: dict[str, Any]) -> str | None:
     data = response_json.get("data")
     if isinstance(data, list) and data:
@@ -416,7 +431,10 @@ def create_edit(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate images via the OpenAI ChatGPT Image API")
-    parser.add_argument("--prompt", "-p", required=True, help="Image description/prompt")
+    parser.add_argument(
+        "--prompt", "-p", required=True,
+        help="Image description/prompt, a UTF-8 file path, or '-' to read from stdin",
+    )
     parser.add_argument("--filename", "-f", required=True, help="Output filename")
     parser.add_argument(
         "--input-image", "-i", nargs="+", action="extend",
@@ -448,11 +466,12 @@ def main() -> None:
 
     start_time = time.perf_counter()
     try:
+        prompt = read_prompt(args.prompt)
         if args.input_image:
             image_paths = validate_input_images(args.input_image)
-            response_json = create_edit(args.prompt, image_paths, size, api_key, base_url)
+            response_json = create_edit(prompt, image_paths, size, api_key, base_url)
         else:
-            response_json = create_generation(args.prompt, size, api_key, base_url)
+            response_json = create_generation(prompt, size, api_key, base_url)
 
         image_value = extract_image_value(response_json)
         write_image_value(image_value, output_path)
