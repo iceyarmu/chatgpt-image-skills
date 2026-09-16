@@ -23,7 +23,11 @@ When invoking the script through the Hermes terminal tool, run it with
 exceed the terminal's 600-second foreground limit.
 
 The script always uses SSE streaming. It retries incomplete streams, transport
-errors, HTTP 429, and transient HTTP 5xx responses up to three times.
+errors, HTTP 429, and transient HTTP 5xx responses up to five times (six total
+attempts), with exponential delays of 20, 40, 80, 160, and 320 seconds.
+For both generation and editing, even a successful HTTP status counts as a failed
+attempt if the stream ends without a final image payload (including an empty
+response, only `[DONE]`, partial images only, or an empty completion payload).
 
 ## Parameters
 

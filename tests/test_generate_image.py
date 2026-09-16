@@ -1,4 +1,5 @@
 import base64
+import errno
 import io
 import importlib.util
 import json
@@ -105,6 +106,46 @@ def test_read_prompt_keeps_literal_text_when_file_does_not_exist():
     assert generate_image.read_prompt("literal prompt") == "literal prompt"
 
 
+@pytest.mark.parametrize("prompt", ["a dancing bear " * 1000, "小熊在跳舞" * 1000])
+def test_read_prompt_keeps_long_literal_text(prompt):
+    assert generate_image.read_prompt(prompt) == prompt
+
+
+@pytest.mark.parametrize("prompt", ["first line\nsecond line", "first\rsecond", "bear\0dance"])
+def test_read_prompt_skips_path_check_for_obvious_text(monkeypatch, prompt):
+    def unexpected_path_check(self):
+        pytest.fail("Text should not be checked as a path")
+
+    monkeypatch.setattr(Path, "is_file", unexpected_path_check)
+
+    assert generate_image.read_prompt(prompt) == prompt
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(errno.ENAMETOOLONG, "File name too long"),
+        PermissionError(errno.EACCES, "Permission denied"),
+        OSError(errno.EIO, "Input/output error"),
+        ValueError("Invalid path"),
+    ],
+)
+def test_read_prompt_keeps_text_when_path_check_fails(monkeypatch, error):
+    def failed_path_check(self):
+        raise error
+
+    monkeypatch.setattr(Path, "is_file", failed_path_check)
+
+    assert generate_image.read_prompt("prompt.txt") == "prompt.txt"
+
+
+def test_read_prompt_from_file_with_spaces_and_no_extension(tmp_path):
+    prompt_path = tmp_path / "my prompt"
+    prompt_path.write_text("小熊在跳舞\n", encoding="utf-8")
+
+    assert generate_image.read_prompt(str(prompt_path)) == "小熊在跳舞\n"
+
+
 def test_final_sse_response_can_be_saved(tmp_path):
     lines = sse_event(final_event()) + ["data: [DONE]", ""]
     payload = generate_image.read_streaming_image_response(FakeResponse(lines=lines))
@@ -128,9 +169,18 @@ def test_incomplete_stream_is_retryable(lines):
         generate_image.read_streaming_image_response(FakeResponse(lines=lines))
 
 
-def test_generation_retries_incomplete_stream(monkeypatch):
+@pytest.mark.parametrize(
+    "incomplete",
+    [
+        [],
+        ["data: [DONE]", ""],
+        sse_event({"type": "image_generation.completed", "b64_json": ""}),
+        sse_event(partial_event()) + ["data: [DONE]", ""],
+    ],
+)
+def test_generation_retries_incomplete_stream(monkeypatch, incomplete):
     outcomes = [
-        FakeResponse(lines=sse_event(partial_event()) + ["data: [DONE]", ""]),
+        FakeResponse(lines=incomplete),
         FakeResponse(lines=sse_event(final_event())),
     ]
     calls = []
@@ -147,7 +197,7 @@ def test_generation_retries_incomplete_stream(monkeypatch):
 
     assert generate_image.extract_image_value(result)
     assert len(calls) == 2
-    assert sleeps == [10]
+    assert sleeps == [20]
     assert all(call["json"]["stream"] is True for call in calls)
     assert all("partial_images" not in call["json"] for call in calls)
 
@@ -178,7 +228,7 @@ def test_generation_retries_transient_failures(monkeypatch, first_outcome):
 
     assert generate_image.extract_image_value(result)
     assert len(calls) == 2
-    assert sleeps == [10]
+    assert sleeps == [20]
 
 
 def test_generation_does_not_retry_permanent_http_error(monkeypatch):
@@ -200,15 +250,17 @@ def test_generation_does_not_retry_permanent_http_error(monkeypatch):
     assert sleeps == []
 
 
-def test_generation_stops_after_three_retries(monkeypatch):
-    incomplete = sse_event(partial_event()) + ["data: [DONE]", ""]
-    outcomes = [FakeResponse(lines=incomplete) for _ in range(4)]
+@pytest.mark.parametrize(
+    "incomplete", [[], sse_event(partial_event()) + ["data: [DONE]", ""]]
+)
+def test_generation_stops_after_five_retries(monkeypatch, incomplete):
+    outcomes = [FakeResponse(lines=incomplete) for _ in range(6)]
     calls = []
     sleeps = []
     install_fake_client(monkeypatch, outcomes, calls)
     monkeypatch.setattr(generate_image.time, "sleep", sleeps.append)
 
-    with pytest.raises(generate_image.ImageRequestError, match="after 3 retries"):
+    with pytest.raises(generate_image.ImageRequestError, match="after 5 retries"):
         generate_image.create_generation(
             "prompt",
             "1024x1024",
@@ -216,15 +268,24 @@ def test_generation_stops_after_three_retries(monkeypatch):
             "https://example.test",
         )
 
-    assert len(calls) == 4
-    assert sleeps == [10, 20, 40]
+    assert len(calls) == 6
+    assert sleeps == [20, 40, 80, 160, 320]
 
 
-def test_edit_reopens_and_closes_input_file_for_retry(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "incomplete",
+    [
+        [],
+        ["data: [DONE]", ""],
+        sse_event({"type": "image_edit.completed", "b64_json": ""}),
+        sse_event(partial_event("image_edit.partial_image")),
+    ],
+)
+def test_edit_reopens_and_closes_input_file_for_retry(monkeypatch, tmp_path, incomplete):
     input_path = tmp_path / "input.png"
     input_path.write_bytes(b"input-image")
     outcomes = [
-        FakeResponse(lines=["data: [DONE]", ""]),
+        FakeResponse(lines=incomplete),
         FakeResponse(lines=sse_event(final_event("image_edit.completed"))),
     ]
     calls = []
@@ -245,6 +306,6 @@ def test_edit_reopens_and_closes_input_file_for_retry(monkeypatch, tmp_path):
     assert len(opened_files) == 2
     assert opened_files[0] is not opened_files[1]
     assert all(file_obj.closed for file_obj in opened_files)
-    assert sleeps == [10]
+    assert sleeps == [20]
     assert all(call["data"]["stream"] == "true" for call in calls)
     assert all("partial_images" not in call["data"] for call in calls)

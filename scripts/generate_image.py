@@ -25,8 +25,8 @@ BASE_URL_ENV = "CHATGPT_IMAGE_API_BASE"
 MODEL = os.environ.get("CHATGPT_IMAGE_MODEL") or "gpt-image-2"
 
 REQUEST_TIMEOUT_SECONDS = 600
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 10
+MAX_RETRIES = 5
+RETRY_DELAY_SECONDS = 20
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 SIZE_MAP = {
@@ -135,8 +135,18 @@ def read_prompt(prompt_argument: str) -> str:
     if prompt_argument == "-":
         return sys.stdin.read()
 
-    prompt_path = Path(prompt_argument)
-    if prompt_path.is_file():
+    # Multiline prose and NUL-containing text are not prompt file paths.
+    if any(character in prompt_argument for character in ("\n", "\r", "\0")):
+        return prompt_argument
+
+    try:
+        prompt_path = Path(prompt_argument)
+        is_file = prompt_path.is_file()
+    except (OSError, ValueError):
+        # Path detection is best-effort: long literals can raise ENAMETOOLONG.
+        return prompt_argument
+
+    if is_file:
         try:
             return prompt_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
